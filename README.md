@@ -18,7 +18,7 @@ Based on [local-tv-show-tracker](https://github.com/sl1pstream/local-tv-show-tra
 
 ## Usage
 1. Clone/download this repo
-2. Run show_tracker.py
+2. Run manga_tracker.py
 
 ## Features & Benefits
 - **Customizability** - Manga names, covers, descriptions, read progress, and status (reading, completed, on dropped...) can all be edited
