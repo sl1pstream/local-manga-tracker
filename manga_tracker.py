@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Manga Tracker - a local manga tracker with a Tkinter GUI and a PWA web UI.
 
-Data lives in manga_data.json next to this script. Covers are copied into
-"Manga Covers/". The web UI is served by the built-in HTTP server, which can
-be started from the GUI's "Start PWA" checkbox.
+Data lives in manga_data.sqlite3 next to this script. Covers are copied into
+"Manga Covers/". The web UI runs in a separate process so it can stay online
+after the GUI closes.
 
 API (used by the Komikku local tracker):
     GET    /api/manga              -> list of entries, sorted by title
@@ -19,21 +19,28 @@ API (used by the Komikku local tracker):
 """
 
 import json
+import ipaddress
 import mimetypes
 import os
+import sqlite3
 import shutil
-import tempfile
+import subprocess
+import sys
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(SCRIPT_DIR, "manga_data.json")
+LEGACY_DATA_FILE = os.path.join(SCRIPT_DIR, "manga_data.json")
+DATA_FILE = os.path.join(SCRIPT_DIR, "manga_data.sqlite3")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 COVERS_DIR = os.path.join(SCRIPT_DIR, "Manga Covers")
 DEFAULT_PORT = 8090
@@ -105,54 +112,115 @@ def save_config(data):
 
 
 # ---------------------------------------------------------------------------
-# JSON store
+# SQLite store
 # ---------------------------------------------------------------------------
 
 class Store:
-    """Thread-safe JSON store keyed by numeric id.
-
-    The GUI and the HTTP server share one instance, so a single re-entrant
-    lock and atomic writes are enough to keep them consistent.
-    """
+    """SQLite-backed store shared safely by the GUI and server processes."""
 
     def __init__(self, path=DATA_FILE):
         self.path = path
         self._lock = threading.RLock()
-        self._data = {"next_id": 1, "manga": {}}
         self.version = 0
-        self._load()
+        existed = os.path.exists(self.path)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._connection = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA busy_timeout = 15000")
+        self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS manga (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                title_key TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'plan_to_read',
+                chapter INTEGER,
+                score INTEGER,
+                cover_image TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        self._connection.commit()
+        self._last_data_version = self._read_data_version()
+        if not existed:
+            self._import_legacy_json()
 
-    def _load(self):
+    def _read_data_version(self):
+        return self._connection.execute("PRAGMA data_version").fetchone()[0]
+
+    def _refresh_version(self):
+        data_version = self._read_data_version()
+        if data_version != self._last_data_version:
+            self.version += 1
+            self._last_data_version = data_version
+
+    def check_for_changes(self):
+        with self._lock:
+            self._refresh_version()
+
+    @staticmethod
+    def _entry(row):
+        if row is None:
+            return None
+        entry = dict(row)
+        entry.pop("title_key", None)
+        return entry
+
+    def _import_legacy_json(self):
         try:
-            with open(self.path, encoding="utf-8") as handle:
-                data = json.load(handle)
+            with open(LEGACY_DATA_FILE, encoding="utf-8") as handle:
+                legacy = json.load(handle)
         except FileNotFoundError:
-            data = None
-        except json.JSONDecodeError as error:
-            print(f"Warning: could not read {self.path}: {error}")
-            data = None
+            return
+        except (json.JSONDecodeError, OSError) as error:
+            print(f"Warning: could not import {LEGACY_DATA_FILE}: {error}")
+            return
 
-        if not isinstance(data, dict) or not isinstance(data.get("manga"), dict):
-            data = {"next_id": 1, "manga": {}}
-
-        data.setdefault("next_id", 1)
-        self._data = data
-        self.version += 1
-
-    def _save_locked(self):
-        directory = os.path.dirname(self.path) or "."
-        os.makedirs(directory, exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(prefix=".manga_data_", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self._data, handle, indent=4, ensure_ascii=False)
-            os.replace(temp_path, self.path)
-        except Exception:
+        entries = legacy.get("manga", {}) if isinstance(legacy, dict) else {}
+        if not isinstance(entries, dict):
+            return
+        with self._lock, self._connection:
+            for key, raw in entries.items():
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    manga_id = int(raw.get("id", key))
+                    fields = self._normalize(raw)
+                    self._connection.execute("""
+                        INSERT OR IGNORE INTO manga
+                            (id, title, title_key, description, status, chapter, score, cover_image, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        manga_id,
+                        fields["title"],
+                        fields["title"].lower(),
+                        fields["description"],
+                        fields["status"],
+                        fields["chapter"],
+                        fields["score"],
+                        fields["cover_image"],
+                        raw.get("updated_at") or _now(),
+                    ))
+                except (TypeError, ValueError, sqlite3.IntegrityError):
+                    continue
+            next_id = legacy.get("next_id", 1)
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
+                next_id = max(1, int(next_id))
+            except (TypeError, ValueError):
+                next_id = 1
+            highest_id = self._connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM manga",
+            ).fetchone()[0]
+            if next_id > highest_id + 1:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO sqlite_sequence(name, seq) VALUES ('manga', ?)",
+                    (next_id - 1,),
+                )
+                self._connection.execute(
+                    "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'manga'",
+                    (next_id - 1,),
+                )
         self.version += 1
 
     def _normalize(self, fields, partial=False):
@@ -174,76 +242,135 @@ class Store:
 
     def all(self):
         with self._lock:
-            entries = [dict(entry) for entry in self._data["manga"].values()]
-        return sorted(entries, key=lambda entry: entry.get("title", "").lower())
+            self._refresh_version()
+            rows = self._connection.execute("SELECT * FROM manga ORDER BY title COLLATE NOCASE, id").fetchall()
+            return [self._entry(row) for row in rows]
 
     def get(self, manga_id):
         with self._lock:
-            entry = self._data["manga"].get(str(manga_id))
-            return dict(entry) if entry else None
+            self._refresh_version()
+            row = self._connection.execute("SELECT * FROM manga WHERE id = ?", (manga_id,)).fetchone()
+            return self._entry(row)
 
     def find_by_title(self, title):
         needle = str(title).strip().lower()
         with self._lock:
-            for entry in self._data["manga"].values():
-                if entry.get("title", "").strip().lower() == needle:
-                    return dict(entry)
-        return None
+            self._refresh_version()
+            row = self._connection.execute(
+                "SELECT * FROM manga WHERE title_key = ?", (needle,),
+            ).fetchone()
+            return self._entry(row)
 
     def create(self, fields):
         with self._lock:
-            needle = str(fields.get("title", "")).strip().lower()
-            for entry in self._data["manga"].values():
-                if entry.get("title", "").strip().lower() == needle:
-                    return dict(entry), False
-
-            manga_id = int(self._data.get("next_id", 1))
-            self._data["next_id"] = manga_id + 1
             entry = self._normalize(fields)
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT * FROM manga WHERE title_key = ?", (entry["title"].lower(),),
+                ).fetchone()
+                if row is not None:
+                    self._connection.commit()
+                    self._refresh_version()
+                    return self._entry(row), False
+                cursor = self._connection.execute("""
+                    INSERT INTO manga (title, title_key, description, status, chapter, score, cover_image, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    entry["title"], entry["title"].lower(), entry["description"], entry["status"], entry["chapter"],
+                    entry["score"], entry["cover_image"], _now(),
+                ))
+                manga_id = cursor.lastrowid
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            self.version += 1
+            self._refresh_version()
             entry["id"] = manga_id
-            entry["updated_at"] = _now()
-            self._data["manga"][str(manga_id)] = entry
-            self._save_locked()
-            return dict(entry), True
+            entry["updated_at"] = self._connection.execute(
+                "SELECT updated_at FROM manga WHERE id = ?", (manga_id,),
+            ).fetchone()[0]
+            return entry, True
 
     def update(self, manga_id, fields):
         with self._lock:
-            key = str(manga_id)
-            entry = self._data["manga"].get(key)
-            if entry is None:
-                return None
-
-            if "title" in fields:
-                needle = str(fields["title"]).strip().lower()
-                for other in self._data["manga"].values():
-                    if other is not entry and other.get("title", "").strip().lower() == needle:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute("SELECT * FROM manga WHERE id = ?", (manga_id,)).fetchone()
+                if row is None:
+                    self._connection.commit()
+                    self._refresh_version()
+                    return None
+                entry = self._entry(row)
+                normalized = self._normalize(fields, partial=True)
+                if "title" in normalized:
+                    duplicate = self._connection.execute(
+                        "SELECT id FROM manga WHERE title_key = ? AND id != ?",
+                        (normalized["title"].lower(), manga_id),
+                    ).fetchone()
+                    if duplicate is not None:
+                        self._connection.rollback()
                         raise ValueError("title_exists")
-
-            merged = dict(entry)
-            merged.update(self._normalize(fields, partial=True))
-            merged["id"] = int(manga_id)
-            merged["updated_at"] = _now()
-            self._data["manga"][key] = merged
-            self._save_locked()
-            return dict(merged)
+                entry.update(normalized)
+                entry["updated_at"] = _now()
+                self._connection.execute("""
+                    UPDATE manga SET title = ?, title_key = ?, description = ?, status = ?, chapter = ?,
+                        score = ?, cover_image = ?, updated_at = ? WHERE id = ?
+                """, (
+                    entry["title"], entry["title"].lower(), entry["description"], entry["status"], entry["chapter"],
+                    entry["score"], entry["cover_image"], entry["updated_at"], manga_id,
+                ))
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            self.version += 1
+            self._refresh_version()
+            return entry
 
     def delete(self, manga_id):
         with self._lock:
-            entry = self._data["manga"].pop(str(manga_id), None)
-            if entry is None:
-                return None
-            self._save_locked()
-            return dict(entry)
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute("SELECT * FROM manga WHERE id = ?", (manga_id,)).fetchone()
+                if row is None:
+                    self._connection.commit()
+                    self._refresh_version()
+                    return None
+                self._connection.execute("DELETE FROM manga WHERE id = ?", (manga_id,))
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            self.version += 1
+            self._refresh_version()
+            return self._entry(row)
 
     def set_cover(self, manga_id, path):
         with self._lock:
-            entry = self._data["manga"].get(str(manga_id))
-            if entry is None:
-                return None
-            entry["cover_image"] = path
-            entry["updated_at"] = _now()
-            self._save_locked()
-            return dict(entry)
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute("SELECT * FROM manga WHERE id = ?", (manga_id,)).fetchone()
+                if row is None:
+                    self._connection.commit()
+                    self._refresh_version()
+                    return None
+                self._connection.execute(
+                    "UPDATE manga SET cover_image = ?, updated_at = ? WHERE id = ?",
+                    (path, _now(), manga_id),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            self.version += 1
+            self._refresh_version()
+            return self.get(manga_id)
+
+    def close(self):
+        with self._lock:
+            self._connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +459,8 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/manga", "/api/manga/"):
             self._json(200, self.store.all())
+        elif path == "/api/health":
+            self._json(200, {"service": "manga-tracker", "ok": True})
         elif path.startswith("/api/manga/"):
             manga_id = path[len("/api/manga/"):].strip("/")
             entry = self.store.get(manga_id)
@@ -358,7 +487,18 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
 
-        if path in ("/api/manga", "/api/manga/"):
+        if path == "/api/server/stop":
+            try:
+                is_loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                is_loopback = False
+            if not is_loopback:
+                self._json(403, {"error": "localhost_only"})
+                return
+            self._json(202, {"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+        elif path in ("/api/manga", "/api/manga/"):
             body = self._read_json()
             if not isinstance(body, dict):
                 self._json(400, {"error": "invalid_json"})
@@ -470,6 +610,40 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not_found"})
 
 
+def _pwa_url(port):
+    return f"http://127.0.0.1:{port}"
+
+
+def _pwa_is_running(port, timeout=0.5):
+    try:
+        with urlopen(f"{_pwa_url(port)}/api/health", timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return response.status == 200 and body.get("service") == "manga-tracker" and body.get("ok") is True
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _start_detached_server(port):
+    options = {
+        "cwd": SCRIPT_DIR,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+    return subprocess.Popen([sys.executable, os.path.abspath(__file__), "--server", str(port)], **options)
+
+
+def _request_server_stop(port, timeout=2):
+    request = Request(f"{_pwa_url(port)}/api/server/stop", data=b"", method="POST")
+    with urlopen(request, timeout=timeout) as response:
+        return response.status == 202
+
+
 # ---------------------------------------------------------------------------
 # Tkinter GUI
 # ---------------------------------------------------------------------------
@@ -488,12 +662,12 @@ class MangaTracker:
         self.current_id = None
         self.image_refs = {}
         self._refreshing = False
-        self._server = None
-        self._server_thread = None
+        self._active_port = None
         self._last_version = -1
 
         self.setup_modern_ui()
         self.create_widgets()
+        self._sync_pwa_state()
         self._poll_store()
 
     def setup_modern_ui(self):
@@ -885,51 +1059,93 @@ class MangaTracker:
 
     # -- PWA ----------------------------------------------------------------
 
+    def _configured_port(self):
+        try:
+            port = int(self.port_entry.get().strip())
+        except ValueError:
+            port = DEFAULT_PORT
+            self.port_entry.delete(0, tk.END)
+            self.port_entry.insert(0, str(port))
+        if not 1 <= port <= 65535:
+            raise ValueError("Port must be between 1 and 65535.")
+        return port
+
+    def _set_pwa_active(self, active, port=None):
+        self.pwa_var.set(active)
+        self._active_port = port if active else None
+        self.port_entry.config(state="disabled" if active else "normal")
+        if active:
+            self.pwa_check.config(text=f"PWA: {_pwa_url(port)}")
+        else:
+            self.pwa_check.config(text="Start PWA")
+
+    def _sync_pwa_state(self):
+        try:
+            port = self._configured_port()
+        except ValueError:
+            port = DEFAULT_PORT
+        if _pwa_is_running(port):
+            self._set_pwa_active(True, port)
+        else:
+            self._set_pwa_active(False)
+
     def toggle_pwa(self):
         if self.pwa_var.get():
             try:
-                port = int(self.port_entry.get().strip())
-            except ValueError:
-                port = DEFAULT_PORT
-                self.port_entry.delete(0, tk.END)
-                self.port_entry.insert(0, str(port))
+                port = self._configured_port()
+            except ValueError as error:
+                messagebox.showerror("Manga Tracker", str(error))
+                self._set_pwa_active(False)
+                return
             save_config({"port": port})
 
-            try:
-                # Bind to all interfaces so the PWA is reachable over Tailscale
-                # as well as from this machine.
-                server = TrackerHTTPServer(("0.0.0.0", port), self.store)
-            except OSError as error:
-                messagebox.showerror("Manga Tracker", f"Could not start the server on port {port}:\n{error}")
-                self.pwa_var.set(False)
+            if not _pwa_is_running(port):
+                try:
+                    _start_detached_server(port)
+                except OSError as error:
+                    messagebox.showerror("Manga Tracker", f"Could not start the server on port {port}:\n{error}")
+                    self._set_pwa_active(False)
+                    return
+
+                deadline = time.monotonic() + 6
+                while time.monotonic() < deadline and not _pwa_is_running(port, timeout=0.25):
+                    time.sleep(0.1)
+
+            if not _pwa_is_running(port):
+                messagebox.showerror(
+                    "Manga Tracker",
+                    f"Could not start the PWA server on port {port}. The port may already be in use.",
+                )
+                self._set_pwa_active(False)
                 return
-
-            self._server = server
-            self._server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-            self._server_thread.start()
-            self.port_entry.config(state="disabled")
-            self.pwa_check.config(text=f"PWA: http://127.0.0.1:{port}")
+            self._set_pwa_active(True, port)
         else:
-            self._stop_server()
-            self.port_entry.config(state="normal")
-            self.pwa_check.config(text="Start PWA")
-
-    def _stop_server(self):
-        if self._server is not None:
-            try:
-                self._server.shutdown()
-            except Exception:
-                pass
-            try:
-                self._server.server_close()
-            except Exception:
-                pass
-            self._server = None
-            self._server_thread = None
+            port = self._active_port
+            if port is None:
+                try:
+                    port = self._configured_port()
+                except ValueError:
+                    port = DEFAULT_PORT
+            if _pwa_is_running(port):
+                try:
+                    _request_server_stop(port)
+                except (OSError, URLError) as error:
+                    messagebox.showerror("Manga Tracker", f"Could not stop the PWA server:\n{error}")
+                    self._set_pwa_active(True, port)
+                    return
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline and _pwa_is_running(port, timeout=0.25):
+                    time.sleep(0.1)
+                if _pwa_is_running(port):
+                    messagebox.showerror("Manga Tracker", "The PWA server did not stop.")
+                    self._set_pwa_active(True, port)
+                    return
+            self._set_pwa_active(False)
 
     # -- polling ------------------------------------------------------------
 
     def _poll_store(self):
+        self.store.check_for_changes()
         if self.store.version != self._last_version:
             self._last_version = self.store.version
             self.refresh_list()
@@ -942,12 +1158,39 @@ class MangaTracker:
 # entry point
 # ---------------------------------------------------------------------------
 
+def run_server(port):
+    os.makedirs(COVERS_DIR, exist_ok=True)
+    store = Store()
+    server = None
+    try:
+        # Bind all interfaces so the PWA remains reachable over Tailscale.
+        server = TrackerHTTPServer(("0.0.0.0", port), store)
+        server.serve_forever()
+    finally:
+        if server is not None:
+            server.server_close()
+        store.close()
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--server":
+        try:
+            port = int(sys.argv[2])
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            raise SystemExit("Server port must be an integer between 1 and 65535.")
+        run_server(port)
+        return
+
     os.makedirs(COVERS_DIR, exist_ok=True)
     store = Store()
     root = tk.Tk()
     MangaTracker(root, store)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":
