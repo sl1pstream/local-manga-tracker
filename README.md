@@ -1,4 +1,6 @@
 # local-manga-tracker
+[See latest updates here](https://github.com/sl1pstream/local-manga-tracker/blob/main/Changelog.md)
+
 Based on [local-tv-show-tracker](https://github.com/sl1pstream/local-tv-show-tracker) - Python script and local PWA to keep track of manga read progress locally (accessible to other devices on local network), created primarily as the host point for my added `Local tracker` feature in [my fork of Komikku](https://github.com/sl1pstream/komikku-testing), an insanely feature-packed manga reader
 
 ## System Requirements
